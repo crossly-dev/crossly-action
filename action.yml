@@ -1,0 +1,97 @@
+# Crossly CLI, in a GitHub workflow.
+#
+# ── WHAT IT IS FOR ───────────────────────────────────────────────────
+# The useful case is not "run a command in CI" — it is treating inventory as
+# something a repository can own. Publish on merge, export nightly to a file
+# somebody can diff, fail a build when a listing that should be live is not.
+#
+# ── WHY IT IS A COMPOSITE ACTION AND NOT A DOCKER ONE ────────────────
+# A Docker action pulls an image on every run and adds 20-40 seconds to a job
+# that is otherwise two seconds of network. This installs one npm package on a
+# runner that already has Node, and caches nothing it does not need to.
+
+name: 'Crossly CLI'
+description: 'Run Crossly commands in a workflow — publish, export, check status.'
+author: 'Crossly'
+
+branding:
+  icon: 'shopping-bag'
+  color: 'green'
+
+inputs:
+  args:
+    description: 'Arguments to `crossly`, e.g. "listings publish --id abc --to ebay,poshmark".'
+    required: true
+  token:
+    description: >
+      A Crossly Personal Access Token. Pass it from a secret, never inline —
+      an expression written literally lands in the workflow file and in every
+      fork of the repository.
+    required: true
+  version:
+    description: 'Version of @crossly/cli to install. Default: latest.'
+    required: false
+    default: 'latest'
+  json:
+    description: 'Append --json, so the output can be parsed by a later step.'
+    required: false
+    default: 'false'
+
+outputs:
+  result:
+    description: 'stdout from the command. With json=true this is parseable.'
+    value: ${{ steps.run.outputs.result }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run Crossly CLI
+      id: run
+      shell: bash
+      env:
+        # Passed through the environment, never on the command line: a token in
+        # argv is visible to every other process on the runner via /proc, and
+        # ends up in the shell trace that `set -x` prints into the log.
+        CROSSLY_PAT: ${{ inputs.token }}
+        CROSSLY_ARGS: ${{ inputs.args }}
+        CROSSLY_JSON: ${{ inputs.json }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${CROSSLY_PAT:-}" ]; then
+          echo "::error::No token. Pass token: \${{ secrets.CROSSLY_PAT }}"
+          exit 1
+        fi
+
+        EXTRA=""
+        if [ "${CROSSLY_JSON}" = "true" ]; then EXTRA="--json"; fi
+
+        # `npx --yes` rather than a global install: a global install mutates the
+        # runner for later steps, and on a self-hosted runner that persists.
+        set +e
+        OUT=$(npx --yes "@crossly/cli@${{ inputs.version }}" ${CROSSLY_ARGS} ${EXTRA} 2>&1)
+        CODE=$?
+        set -e
+
+        echo "$OUT"
+
+        # Multi-line safe. `result=$OUT` breaks on the first newline and
+        # silently truncates a JSON payload to its opening brace.
+        {
+          echo "result<<CROSSLY_EOF"
+          echo "$OUT"
+          echo "CROSSLY_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        # The CLI's exit codes are meaningful, so they are surfaced rather than
+        # collapsed: 2 is a usage error in the workflow itself, 4 means the
+        # secret has expired, 5 means the token is missing a scope. A workflow
+        # that treats all three as "failed" makes the maintainer guess.
+        case $CODE in
+          0) ;;
+          2) echo "::error::Usage error — check the `args` input." ;;
+          4) echo "::error::Token rejected. Rotate CROSSLY_PAT." ;;
+          5) echo "::error::Token is missing a required scope. Re-mint it with the scope the command needs." ;;
+          *) echo "::error::Crossly command failed (exit $CODE)." ;;
+        esac
+        exit $CODE
